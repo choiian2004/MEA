@@ -1,0 +1,145 @@
+import maxlab as mx
+import time
+from pathlib import Path
+
+# --- 설정 파라미터 ---
+PULSE_COUNT = 50            # 스캔(구성)당 자극 횟수 (예: 평균화를 위해 50회)
+INTER_PULSE_MS = 200        # 자극 간격 (ms) -> 5Hz
+PHASE_US = 200              # Biphasic 펄스의 유지 시간 (us)
+AMPLITUDE_MV = 150          # 자극 진폭 (mV)
+TOTAL_SCANS = 798           # 전체 스캔 횟수 (42 x 19)
+
+def amplitude_mV_to_DAC_bits(amplitude_mV):
+    """mV 단위의 진폭을 10-bit DAC 값으로 변환합니다."""
+    LSB_mV = float(mx.query_DAC_lsb_mV())
+    if abs(amplitude_mV) > 1000.0:
+        raise ValueError("진폭은 1.0V(1000mV)를 초과할 수 없습니다.")
+    return int(512 - (amplitude_mV / LSB_mV))
+
+def create_stim_sequence():
+    """정밀한 자극 타이밍을 제어하기 위한 시퀀스를 생성합니다."""
+    seq = mx.Sequence()
+    phase_samples = int(PHASE_US / 50)
+    inter_pulse_samples = int((INTER_PULSE_MS * 1000) / 50)
+    
+    for i in range(PULSE_COUNT):
+        # 데이터 분석 시 Trigger 기준으로 사용할 이벤트 마커 삽입
+        seq.append(mx.Event(0, 1, i+1, f"stim_pulse_{i+1}"))
+        
+        # DAC 0번을 사용하여 Biphasic 자극 펄스 인가
+        seq.append(mx.DAC(0, amplitude_mV_to_DAC_bits(AMPLITUDE_MV)))
+        seq.append(mx.DelaySamples(phase_samples))
+        seq.append(mx.DAC(0, amplitude_mV_to_DAC_bits(-AMPLITUDE_MV)))
+        seq.append(mx.DelaySamples(phase_samples))
+        seq.append(mx.DAC(0, 512)) # 0V로 복귀
+        
+        # 다음 펄스 전까지 대기
+        seq.append(mx.DelaySamples(inter_pulse_samples - 2 * phase_samples))
+    return seq
+
+def run_evoked_axon_tracking():
+    # 1. 시스템 초기화 및 자극 유닛 활성화
+    print("시스템을 초기화합니다...")
+    mx.initialize()
+    if mx.send(mx.Core().enable_stimulation_power(True)) != "Ok":
+        raise RuntimeError("시스템 초기화 실패")
+    time.sleep(mx.Timing.waitInit)
+
+    wells =  # MaxOne 단일 웰 지정
+    mx.activate(wells)
+
+    # 2. 데이터 저장 객체 설정 (용량 최적화를 위해 Delta Compression 활성화)
+    s = mx.Saving()
+    s.set_legacy_format(False) # Legacy 포맷 비활성화 (압축 활성화 지원) [1]
+    s.open_directory("/home/data/Evoked_AxonTracking")
+
+    # 3. 자극 시퀀스 객체 준비
+    seq = create_stim_sequence()
+    record_time_per_scan = (PULSE_COUNT * INTER_PULSE_MS) / 1000.0 + 1.0 # 스캔 당 필요 시간(초)
+
+    # 4. 798번의 병렬 스캔 루프 (가로 42칸 x 세로 19칸 분할)
+    print(f"총 {TOTAL_SCANS}개의 구역 스캔을 시작합니다.")
+    for scan_idx in range(TOTAL_SCANS):
+        # 현재 스캔의 기준 좌표 오프셋 계산
+        dx = scan_idx % 42
+        dy = scan_idx // 42
+        
+        stim_electrodes = []
+        rec_electrodes = []
+
+        # 30개 구역(가로 5 x 세로 6)의 동시 자극 및 측정 전극 계산
+        for i in range(5):
+            for j in range(6):
+                # 칩 테두리 여백(가로 5, 세로 3)을 더하여 실제 좌표 도출
+                x = 5 + (i * 42) + dx
+                y = 3 + (j * 19) + dy
+                stim_id = x * 120 + y # X, Y 좌표를 1D 전극 ID로 변환
+                stim_electrodes.append(stim_id)
+                
+                # 자극 전극을 중심으로 반지름 3(직경 7) 이내의 주변 전극 추출 [2]
+                neighbors = mx.util.electrode_neighbors(stim_id, 3)
+                # 포화(Saturation) 방지를 위해 자극 전극 자체는 기록에서 제외
+                neighbors = [n for n in neighbors if n != stim_id]
+                rec_electrodes.extend(neighbors)
+
+        # [TIP] ActivityScan 데이터를 불러와 rec_electrodes 중 '활성 세포가 없는 빈 공간'이면 
+        # continue로 현재 scan_idx를 스킵하는 코드를 여기에 추가할 수 있습니다.
+
+        # 5. 전극 구성(Routing) 및 다운로드
+        array = mx.Array("online")
+        array.reset()
+        array.clear_selected_electrodes()
+        
+        # 안전장치: 전극 수가 1020개를 초과할 경우 제한
+        if len(rec_electrodes) > 1020:
+            rec_electrodes = rec_electrodes[:1020]
+            
+        array.select_electrodes(rec_electrodes)
+        array.select_stimulation_electrodes(stim_electrodes)
+        array.route()
+
+        # 자극 유닛(최대 30개) 연결
+        stim_units = []
+        for stim_el in stim_electrodes:
+            array.connect_electrode_to_stimulation(stim_el)
+            unit = array.query_stimulation_at_electrode(stim_el)
+            if unit:
+                stim_units.append(int(unit))
+                
+        # 연결된 자극 유닛들의 전원을 켜고 DAC 0번 소스에 매핑 [3]
+        for unit in stim_units:
+            mx.send(mx.StimulationUnit(unit).power_up(True).connect(True).set_voltage_mode().dac_source(0))
+
+        # 하드웨어 칩에 구성 적용 및 안정화 대기
+        array.download(wells)
+        time.sleep(mx.Timing.waitAfterDownload)
+        mx.offset()
+        time.sleep(mx.Timing.waitInMX1Offset)
+        mx.clear_events()
+
+        # 6. 데이터 기록 및 자극 실행
+        s.start_file(f"scan_{scan_idx:03d}")
+        s.group_define(0, "axon_channels", list(range(1024))) # 신포맷 기록 그룹 정의 [4]
+        s.start_recording(wells)
+        
+        time.sleep(0.5) # 자극 전 베이스라인 확보
+        
+        # 하드웨어 타이머를 통해 정밀하게 자극 시퀀스 전송
+        seq.send()
+        time.sleep(record_time_per_scan) # 자극이 끝날 때까지 대기
+        
+        s.stop_recording()
+        time.sleep(mx.Timing.waitAfterRecording)
+        s.stop_file()
+        s.group_delete_all()
+        
+        # 다음 스캔을 위해 사용했던 자극 유닛 전원 끄기 [5]
+        for unit in stim_units:
+            mx.send(mx.StimulationUnit(unit).power_up(False))
+            
+        print(f"Scan {scan_idx + 1}/{TOTAL_SCANS} 완료.")
+
+    print("모든 Stimulus-Axon Tracking 스캔이 성공적으로 완료되었습니다!")
+
+if __name__ == "__main__":
+    run_evoked_axon_tracking()
