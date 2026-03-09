@@ -8,9 +8,9 @@ import os
 # ==========================================
 # 1. 실험 설정 파라미터
 # ==========================================
-TARGET_ELECTRODE = 13500       # 자극을 가할 중앙 전극 번호 (예: 칩 중앙 부근)
-RADIUS = 3                     # 측정할 주변 전극의 반경 (반경 3 = 28개 전극)
-PULSE_COUNT = 20               # 자극 반복 횟수 (평균화를 위해 20회 반복)
+TARGET_ELECTRODE = 13500       # 자극을 가할 중앙 전극 번호
+RADIUS = 3                     # 측정할 주변 전극의 반경
+PULSE_COUNT = 20               # 자극 반복 횟수 (평균화용)
 AMPLITUDE_MV = 150             # 자극 진폭 (mV)
 PHASE_US = 200                 # Biphasic 펄스의 Phase 유지 시간 (us)
 INTER_PULSE_MS = 500           # 자극 간격 (ms) -> 2Hz
@@ -25,80 +25,81 @@ def run_stimulation_test():
     print("시스템을 초기화합니다...")
     mx.initialize()
     if mx.send(mx.Core().enable_stimulation_power(True)) != "Ok":
-        raise RuntimeError("시스템 초기화 실패") [1, 2]
-    time.sleep(mx.Timing.waitInit) [2, 3]
+        raise RuntimeError("시스템 초기화 실패")
+    time.sleep(mx.Timing.waitInit)
 
-    wells =  # MaxOne 단일 웰 지정 [4]
-    mx.activate(wells) [5, 6]
+    # MaxOne 단일 웰 지정 (일반적으로 0번 웰)
+    wells = [0]
+    mx.activate(wells)
 
     # 주변 측정 전극 자동 추출
-    rec_electrodes = mx.util.electrode_neighbors(TARGET_ELECTRODE, RADIUS) [7]
-    # 자극 전극 자체는 기록에서 제외 (포화 방지)
+    rec_electrodes = mx.util.electrode_neighbors(TARGET_ELECTRODE, RADIUS)
+    # 자극 전극 자체는 기록에서 제외 (Saturation 방지)
     rec_electrodes = [el for el in rec_electrodes if el != TARGET_ELECTRODE]
     stim_electrodes = [TARGET_ELECTRODE]
 
     print(f"타겟 전극: {TARGET_ELECTRODE}, 측정 전극 수: {len(rec_electrodes)}개")
 
     # 어레이 구성 및 라우팅
-    array = mx.Array("test_array") [8, 9]
-    array.reset() [10, 11]
-    array.select_electrodes(rec_electrodes) [11, 12]
-    array.select_stimulation_electrodes(stim_electrodes) [11, 13]
-    array.route() [10, 11]
+    array = mx.Array("test_array")
+    array.reset()
+    array.select_electrodes(rec_electrodes)
+    array.select_stimulation_electrodes(stim_electrodes)
+    array.route()
 
     # 자극 유닛 연결
-    array.connect_electrode_to_stimulation(TARGET_ELECTRODE) [14, 15]
-    stim_unit = int(array.query_stimulation_at_electrode(TARGET_ELECTRODE)) [16, 17]
+    array.connect_electrode_to_stimulation(TARGET_ELECTRODE)
+    stim_unit = int(array.query_stimulation_at_electrode(TARGET_ELECTRODE))
     
     # 자극 유닛 전원 켜기 (전압 모드, DAC 0번 소스)
-    mx.send(mx.StimulationUnit(stim_unit).power_up(True).connect(True).set_voltage_mode().dac_source(0)) [8, 18, 19]
+    mx.send(mx.StimulationUnit(stim_unit).power_up(True).connect(True).set_voltage_mode().dac_source(0))
 
     # 하드웨어 다운로드 및 오프셋 보정
-    array.download(wells) [20, 21]
-    time.sleep(mx.Timing.waitAfterDownload) [3, 21]
-    mx.offset() [22, 23]
-    time.sleep(mx.Timing.waitInMX1Offset) [24]
-    mx.clear_events() [23, 24]
+    array.download(wells)
+    time.sleep(mx.Timing.waitAfterDownload)
+    mx.offset()
+    time.sleep(mx.Timing.waitInMX1Offset)
+    mx.clear_events()
 
     # 정밀한 자극 시퀀스 준비
-    seq = mx.Sequence() [25, 26]
-    lsb_mV = float(mx.query_DAC_lsb_mV()) [7, 27]
-    amplitude_bits = int(512 - (AMPLITUDE_MV / lsb_mV)) [28, 29]
-    phase_samples = int(PHASE_US / 50) # 1 sample = 50us [30, 31]
-    inter_pulse_samples = int((INTER_PULSE_MS * 1000) / 50) [30, 31]
+    seq = mx.Sequence()
+    lsb_mV = float(mx.query_DAC_lsb_mV())
+    amplitude_bits = int(512 - (AMPLITUDE_MV / lsb_mV))
+    phase_samples = int(PHASE_US / 50) # 1 sample = 50us
+    inter_pulse_samples = int((INTER_PULSE_MS * 1000) / 50)
 
     for i in range(PULSE_COUNT):
-        seq.append(mx.Event(0, 1, i+1, f"pulse_{i+1}")) [32, 33]
-        seq.append(mx.DAC(0, amplitude_bits)) [33, 34]
-        seq.append(mx.DelaySamples(phase_samples)) [30, 33]
-        seq.append(mx.DAC(0, 512 + (512 - amplitude_bits))) [33, 34]
-        seq.append(mx.DelaySamples(phase_samples)) [30, 33]
-        seq.append(mx.DAC(0, 512)) [33, 34]
-        seq.append(mx.DelaySamples(inter_pulse_samples - 2 * phase_samples)) [30, 35]
+        seq.append(mx.Event(0, 1, i+1, f"pulse_{i+1}"))
+        seq.append(mx.DAC(0, amplitude_bits))
+        seq.append(mx.DelaySamples(phase_samples))
+        seq.append(mx.DAC(0, 512 + (512 - amplitude_bits)))
+        seq.append(mx.DelaySamples(phase_samples))
+        seq.append(mx.DAC(0, 512))
+        seq.append(mx.DelaySamples(inter_pulse_samples - 2 * phase_samples))
 
     # 데이터 저장 설정 및 기록 시작
     os.makedirs(DATA_DIR, exist_ok=True)
-    s = mx.Saving() [35, 36]
-    s.set_legacy_format(False) [37]
-    s.open_directory(DATA_DIR) [35, 38]
-    s.start_file(FILE_NAME) [35, 39]
-    s.group_define(0, "all_channels", list(range(1024))) [35, 40]
+    s = mx.Saving()
+    s.set_legacy_format(False)
+    s.open_directory(DATA_DIR)
+    s.start_file(FILE_NAME)
+    s.group_define(0, "all_channels", list(range(len(rec_electrodes))))
     
     print("기록을 시작합니다...")
-    s.start_recording(wells) [35, 39]
+    s.start_recording(wells)
     time.sleep(1) # 베이스라인 대기
     
     print(f"자극을 전달합니다. ({PULSE_COUNT}회)")
-    seq.send() [5, 35]
+    seq.send()
     time.sleep((PULSE_COUNT * INTER_PULSE_MS) / 1000.0 + 1.0)
     
-    s.stop_recording() [41, 42]
-    time.sleep(mx.Timing.waitAfterRecording) [24, 42]
-    s.stop_file() [41, 42]
-    s.group_delete_all() [42, 43]
+    s.stop_recording()
+    time.sleep(mx.Timing.waitAfterRecording)
+    s.stop_file()
+    s.group_delete_all()
     
     # 자극 유닛 끄기
-    mx.send(mx.StimulationUnit(stim_unit).power_up(False)) [8, 44]
+    mx.send(mx.StimulationUnit(stim_unit).power_up(False))
     print(f"기록 완료: {DATA_DIR}/{FILE_NAME}.raw.h5")
 
 
@@ -107,10 +108,10 @@ def run_stimulation_test():
 # ==========================================
 def analyze_connectivity():
     print("데이터를 분석하여 연결성을 시각화합니다...")
-    file_path = os.path.join(DATA_DIR, f"{FILE_NAME}.raw.h5") [42, 45]
+    file_path = os.path.join(DATA_DIR, f"{FILE_NAME}.raw.h5")
     
-    SAMPLING_RATE = 20000.0 [46]
-    ARTIFACT_BLANK_MS = 0.5  # 자극 아티팩트 회피 구간
+    SAMPLING_RATE = 20000.0
+    ARTIFACT_BLANK_MS = 0.5   # 자극 아티팩트 회피 구간
     ANALYSIS_WINDOW_MS = 15.0 # 반응 관찰 구간
     
     blank_idx = int((ARTIFACT_BLANK_MS / 1000.0) * SAMPLING_RATE)
@@ -119,26 +120,29 @@ def analyze_connectivity():
     footprints = {}
 
     with h5py.File(file_path, 'r') as f:
-        # 데이터 및 메타데이터 로드
-        traces = f["wells/well000/rec0000/groups/all_channels/raw"] [42, 45]
-        events = f["wells/well000/rec0000/events"][:] [42, 47]
-        mapping = f["wells/well000/rec0000/groups/all_channels/mapping"][:]
-        frame_nos = f["wells/well000/rec0000/groups/all_channels/frame_nos"][:] [42, 47]
+        # 데이터 및 메타데이터 경로 설정
+        rec_path = "wells/well000/rec0000"
+        group_path = f"{rec_path}/groups/all_channels"
         
-        first_fno = frame_nos [42, 47]
-        n_channels = traces.shape
+        traces = f[f"{group_path}/raw"]
+        events = f[f"{rec_path}/events"]
+        mapping = f[f"{group_path}/mapping"]
+        frame_nos = f[f"{group_path}/frame_nos"]
         
-        # 자극 이벤트 시점(Timestamp) 추출
-        pulse_frames = [event for event in events] [42, 47]
+        first_fno = frame_nos[0]
+        n_channels = traces.shape[0]
+        
+        # 자극 이벤트 시점(Timestamp) 추출 (일반적으로 'frame' 컬럼 사용)
+        pulse_frames = events['frame']
         
         # 스파이크 트리거 평균화(Spike-Triggered Averaging)
         avg_waveform = np.zeros((n_channels, window_idx - blank_idx))
         valid_count = 0
         
         for fno in pulse_frames:
-            start = int(fno - first_fno) + blank_idx [42, 47]
+            start = int(fno - first_fno) + blank_idx
             end = start + (window_idx - blank_idx)
-            if end < traces.shape[48] and start >= 0:
+            if end < traces.shape[1] and start >= 0:
                 avg_waveform += traces[:, start:end]
                 valid_count += 1
                 
@@ -150,23 +154,25 @@ def analyze_connectivity():
         
         # 물리적 좌표(X, Y)에 진폭 매핑
         for i in range(len(mapping)):
-            ch = mapping[i]['channel']
+            ch = i
             x = mapping[i]['x']
             y = mapping[i]['y']
             if ch < len(amplitudes):
                 footprints[(x, y)] = amplitudes[ch]
 
     # 시각화 (Scatter Plot)
-    x_coords = np.array([k for k in footprints.keys()])
-    y_coords = np.array([k[48] for k in footprints.keys()])
+    coords = np.array(list(footprints.keys()))
+    x_coords = coords[:, 0]
+    y_coords = coords[:, 1]
     amps = np.array(list(footprints.values()))
     
     # 노이즈를 제외하기 위해 하위 20%의 신호는 필터링
     threshold = np.percentile(amps, 20)
     
-    plt.figure(figsize=(8, 6), facecolor='black')
-    sc = plt.scatter(x_coords[amps > threshold], y_coords[amps > threshold], 
-                     c=amps[amps > threshold], cmap='hot', s=100, alpha=0.9,
+    plt.figure(figsize=(10, 8), facecolor='black')
+    mask = amps > threshold
+    sc = plt.scatter(x_coords[mask], y_coords[mask], 
+                     c=amps[mask], cmap='hot', s=100, alpha=0.9,
                      vmin=threshold, vmax=np.percentile(amps, 99))
     
     plt.colorbar(sc, label='Signal Amplitude (bits)')
