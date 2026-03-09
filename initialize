@@ -1,0 +1,48 @@
+import maxlab as mx
+import time
+
+def setup_maxone_system():
+    # 1. 시스템 초기화 및 자극 장치 전원 켜기
+    print("MaxOne 시스템을 초기화하는 중입니다...")
+    mx.initialize()
+    if mx.send(mx.Core().enable_stimulation_power(True)) != "Ok":
+        raise RuntimeError("시스템 초기화에 실패했습니다.")
+    
+    # 시스템이 완전히 초기화될 때까지 대기
+    time.sleep(mx.Timing.waitInit)
+
+    # 2. 웰(Well) 활성화
+    # 요청하신 대로 wells를 빈 리스트로 설정합니다.
+    wells = []
+    mx.activate(wells)
+
+    # 3. 전극 구성(Configuration) 준비 및 하드웨어 다운로드
+    print("전극 구성을 하드웨어에 적용하는 중입니다...")
+    array = mx.Array("initial_setup")
+    array.reset()
+    
+    # 파이썬에서 직접 임의의 전극(예: 0번~9번)을 선택하여 라우팅할 경우
+    example_electrodes = list(range(10)) 
+    array.select_electrodes(example_electrodes)
+    array.route()
+    
+    # 설정한 구성을 실제 기기 하드웨어에 다운로드
+    array.download()
+    
+    # 다운로드가 완료될 때까지 대기
+    time.sleep(mx.Timing.waitAfterDownload)
+
+    # 4. 오프셋 보정 (DC Offset Compensation)
+    print("오프셋 보정을 진행합니다... (MaxOne 기준 약 5초 소요)")
+    mx.offset()
+    
+    # MaxOne 전용 오프셋 대기 시간 적용
+    time.sleep(mx.Timing.waitInMX1Offset) 
+
+    # 5. 불필요한 과거 이벤트 버퍼 비우기
+    mx.clear_events()
+    
+    print("시스템 설정이 완료되었습니다.")
+
+if __name__ == "__main__":
+    setup_maxone_system()
