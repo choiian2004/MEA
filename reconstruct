@@ -1,0 +1,136 @@
+import h5py
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+from pathlib import Path
+
+# --- 분석 설정 파라미터 ---
+DATA_DIR = "/home/data/Evoked_AxonTracking"
+TOTAL_SCANS = 798
+SAMPLING_RATE = 20000 # MaxOne 샘플링 레이트 (20kHz, 1 sample = 50us)
+
+# 자극 아티팩트 회피 및 분석 구간 설정
+ARTIFACT_BLANK_MS = 0.5   # 자극 직후 아티팩트 구간 (0.5ms 회피)
+ANALYSIS_WINDOW_MS = 10.0 # 자극 후 반응을 관찰할 구간 (10ms)
+
+blank_samples = int((ARTIFACT_BLANK_MS / 1000.0) * SAMPLING_RATE)
+window_samples = int((ANALYSIS_WINDOW_MS / 1000.0) * SAMPLING_RATE)
+
+def reconstruct_axon_footprints():
+    # 칩 전체 크기에 해당하는 빈 맵 생성 (최대 물리적 좌표에 맞춰 딕셔너리 사용)
+    # key: (x_um, y_um) 좌표, value: peak-to-peak 진폭
+    footprint_map = {}
+
+    print(f"데이터 폴더 '{DATA_DIR}'에서 파일 분석을 시작합니다...")
+
+    for scan_idx in range(TOTAL_SCANS):
+        file_path = os.path.join(DATA_DIR, f"scan_{scan_idx:03d}.raw.h5")
+        if not os.path.exists(file_path):
+            continue
+            
+        with h5py.File(file_path, 'r') as f:
+            # 1. 데이터 및 메타데이터 로드
+            try:
+                traces = f["wells/well000/rec0000/groups/axon_channels/raw"]
+                events = f["wells/well000/rec0000/events"][:]
+                mapping = f["wells/well000/rec0000/groups/axon_channels/mapping"][:]
+                frame_nos = f["wells/well000/rec0000/groups/axon_channels/frame_nos"][:]
+            except KeyError:
+                print(f"Scan {scan_idx:03d}의 데이터 구조를 찾을 수 없어 건너뜁니다.")
+                continue
+
+            first_fno = frame_nos
+            n_channels = traces.shape
+            
+            # 자극 이벤트 시간 추출 (프레임 번호 기준)
+            pulse_frame_nos = [event for event in events]
+            n_pulses = len(pulse_frame_nos)
+
+            if n_pulses == 0:
+                continue
+
+            # 2. Stimulus-Triggered Averaging (자극 기준 파형 평균화)
+            # 노이즈를 0으로 수렴시키기 위해 각 채널별로 자극 횟수만큼 신호를 누적
+            avg_waveform = np.zeros((n_channels, window_samples - blank_samples))
+            
+            valid_pulses = 0
+            for fno in pulse_frame_nos:
+                # 현재 자극 시점의 배열 내 인덱스 계산
+                start_idx = int(fno - first_fno) + blank_samples
+                end_idx = start_idx + (window_samples - blank_samples)
+                
+                # 파일 인덱스 범위를 초과하지 않는지 확인
+                if end_idx < traces.shape[5] and start_idx >= 0:
+                    avg_waveform += traces[:, start_idx:end_idx]
+                    valid_pulses += 1
+            
+            if valid_pulses == 0:
+                continue
+                
+            # 평균 계산
+            avg_waveform /= valid_pulses
+
+            # 3. Peak-to-Peak 진폭(Amplitude) 추출
+            # 측정된 평균 파형에서 각 채널의 가장 강한 신호(축삭의 전기적 크기)를 계산
+            amplitudes = np.max(avg_waveform, axis=1) - np.min(avg_waveform, axis=1)
+
+            # 4. 물리적 좌표(X, Y µm)에 데이터 맵핑
+            for i in range(len(mapping)):
+                ch = mapping[i]['channel']
+                x = mapping[i]['x']
+                y = mapping[i]['y']
+                
+                # 자극 전극 자체이거나 기준치 이하의 노이즈는 제외할 수 있음
+                if ch < len(amplitudes):
+                    # 동일 좌표가 여러 스캔에서 겹칠 경우 가장 높은 신호를 보존
+                    if (x, y) not in footprint_map or footprint_map[(x, y)] < amplitudes[ch]:
+                        footprint_map[(x, y)] = amplitudes[ch]
+
+        if (scan_idx + 1) % 50 == 0:
+            print(f"{scan_idx + 1}/{TOTAL_SCANS} 파일 처리 완료...")
+
+    print("모든 분석이 완료되었습니다. 시각화를 준비합니다.")
+    return footprint_map
+
+def plot_axon_connectivity(footprint_map):
+    # 데이터 추출
+    x_coords = np.array([k for k in footprint_map.keys()])
+    y_coords = np.array([k[5] for k in footprint_map.keys()])
+    amps = np.array(list(footprint_map.values()))
+
+    # 노이즈 제거: 하위 10% 신호를 필터링하여 뚜렷한 연결만 남김
+    threshold = np.percentile(amps, 80) 
+    
+    # 시각화 (산점도를 이용한 히트맵)
+    plt.figure(figsize=(14, 8), dpi=150, facecolor='black')
+    
+    # 배경으로 전체 MEA 영역 희미하게 표시 (선택사항)
+    plt.scatter(x_coords, y_coords, c='gray', s=5, alpha=0.1)
+
+    # 필터링된 활성 축삭 경로 그리기
+    sc = plt.scatter(x_coords[amps > threshold], y_coords[amps > threshold], 
+                     c=amps[amps > threshold], cmap='hot', s=15, alpha=0.9,
+                     vmin=threshold, vmax=np.percentile(amps, 99))
+    
+    # 그래프 서식 설정
+    plt.colorbar(sc, label='Peak-to-Peak Amplitude (bits)', pad=0.02)
+    plt.title('Reconstructed Axonal Connectivity Map (Stimulus-Evoked)', color='white', fontsize=16)
+    plt.xlabel('X Position (µm)', color='white')
+    plt.ylabel('Y Position (µm)', color='white')
+    plt.tick_params(colors='white')
+    
+    # 배경을 검은색으로 설정 (형광 이미지처럼 뚜렷하게 보이도록)
+    ax = plt.gca()
+    ax.set_facecolor('black')
+    
+    # 축 비율을 동일하게 맞춰 칩의 실제 비율과 동일하게 표시
+    plt.axis('equal') 
+    plt.tight_layout()
+    
+    # 이미지 저장 및 출력
+    plt.savefig("Evoked_Axon_Connectivity.png", facecolor='black')
+    plt.show()
+
+if __name__ == "__main__":
+    mapped_data = reconstruct_axon_footprints()
+    plot_axon_connectivity(mapped_data)
